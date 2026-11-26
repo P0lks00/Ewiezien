@@ -2,29 +2,25 @@
 """
 Generator danych testowych dla bazy danych Systemu Ewidencji Zakładu Karnego (PostgreSQL).
 
-Pobiera dane zewnętrzne z publicznych API (bez kluczy API, tylko biblioteka standardowa):
+Źródła danych:
 - Dane osobowe (imiona, nazwiska, płeć, daty urodzenia):
-    * domyślnie: FakerAPI v2 (https://fakerapi.it/api/v2/persons?_locale=pl_PL)
-    * alternatywnie / fallback: RandomUser API (https://randomuser.me/api/)
-- Lista polskich sądów powszechnych (Sądy Rejonowe / Okręgowe / Apelacyjne):
-    * SAOS API — System Analizy Orzeczeń Sądowych
-      (https://www.saos.org.pl/api/dump/commonCourts)
+    FakerAPI v2 (https://fakerapi.it/api/v2/persons?_locale=pl_PL) — bez fallbacku.
+- Sądy powszechne oraz słowniki domenowe (stopnie SW, artykuły KK, incydenty, bloki cel):
+    wbudowane słowniki domenowe.
 
-Zgodny ze schematem i warunkami integralności z dokumentu Bazy-danych-projekt-1.pdf:
-- Tabele: cele, personel, wiezniowie, wyroki, przydzialy_cel, widzenia, incydenty
-- Wszystkie ograniczenia CHECK, UNIQUE, NOT NULL oraz klucze obce
-- Zgodność z wyzwalaczami (pojemność celi, jeden aktywny przydział, blokada dodawania
-  widzeń/przydziałów dla nieaktywnych więźniów).
+Wyjście:
+- Wyłącznie skrypt SQL dla PostgreSQL (transakcja BEGIN..COMMIT + synchronizacja sekwencji).
+
+Zgodny ze schematem, ograniczeniami integralności i wyzwalaczami z Bazy-danych-projekt-1.pdf.
+Brak zewnętrznych zależności (tylko biblioteka standardowa Pythona).
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import random
-import sys
-import urllib.error
+import re
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -34,8 +30,47 @@ from typing import Any
 
 
 # ---------------------------------------------------------------------------
-# Konfiguracja domenowa zakładu karnego (wartości słownikowe / reguły biznesowe)
+# Słowniki domenowe (sądy oraz wartości charakterystyczne dla zakładu karnego)
 # ---------------------------------------------------------------------------
+
+SADY = [
+    "Sąd Rejonowy dla m.st. Warszawy w Warszawie",
+    "Sąd Okręgowy w Warszawie",
+    "Sąd Apelacyjny w Warszawie",
+    "Sąd Rejonowy dla Krakowa-Śródmieścia w Krakowie",
+    "Sąd Okręgowy w Krakowie",
+    "Sąd Apelacyjny w Krakowie",
+    "Sąd Rejonowy Gdańsk-Południe w Gdańsku",
+    "Sąd Okręgowy w Gdańsku",
+    "Sąd Apelacyjny w Gdańsku",
+    "Sąd Rejonowy dla Wrocławia-Śródmieścia we Wrocławiu",
+    "Sąd Okręgowy we Wrocławiu",
+    "Sąd Apelacyjny we Wrocławiu",
+    "Sąd Rejonowy Poznań-Stare Miasto w Poznaniu",
+    "Sąd Okręgowy w Poznaniu",
+    "Sąd Apelacyjny w Poznaniu",
+    "Sąd Rejonowy dla Łodzi-Śródmieścia w Łodzi",
+    "Sąd Okręgowy w Łodzi",
+    "Sąd Apelacyjny w Łodzi",
+    "Sąd Rejonowy Katowice-Wschód w Katowicach",
+    "Sąd Okręgowy w Katowicach",
+    "Sąd Apelacyjny w Katowicach",
+    "Sąd Rejonowy Lublin-Zachód w Lublinie",
+    "Sąd Okręgowy w Lublinie",
+    "Sąd Rejonowy Szczecin-Centrum w Szczecinie",
+    "Sąd Okręgowy w Szczecinie",
+    "Sąd Rejonowy w Bydgoszczy",
+    "Sąd Okręgowy w Bydgoszczy",
+    "Sąd Rejonowy w Białymstoku",
+    "Sąd Okręgowy w Białymstoku",
+    "Sąd Rejonowy w Rzeszowie",
+    "Sąd Okręgowy w Rzeszowie",
+    "Sąd Rejonowy w Toruniu",
+    "Sąd Rejonowy w Olsztynie",
+    "Sąd Rejonowy w Kielcach",
+    "Sąd Rejonowy w Opolu",
+    "Sąd Rejonowy w Zielonej Górze",
+]
 
 STOPNIE_SW = [
     "szeregowy",
@@ -131,12 +166,34 @@ BLOKI_KONFIG: list[tuple[str, str, int, int]] = [
     ("IZ", "izolatka", 1, 2),
 ]
 
-STATUSY_WIEZNIOW = ["osadzony", "zwolniony", "przeniesiony", "zbiegly", "zmarly"]
+STATUSY_WIEZNIOW = ("osadzony", "zwolniony", "przeniesiony", "zbiegly", "zmarly")
 STATUSY_WAGI = [0.68, 0.18, 0.08, 0.03, 0.03]
+POZIOMY_ZABEZPIECZEN = ("otwarty", "polotwarty", "zamkniety", "izolatka")
+TYPY_INCYDENTOW = ("bojka", "kontrabanda", "proba_ucieczki", "nagroda", "inne")
+
+IMIONA_MESKIE_NA_A = {"Kuba", "Barnaba", "Bonawentura", "Kosma", "Jarema", "Dyzma"}
+PESEL_RE = re.compile(r"^[0-9]{11}$")
+PESEL_WAGI = (1, 3, 7, 9, 1, 3, 7, 9, 1, 3)
 
 
 # ---------------------------------------------------------------------------
-# Klient zewnętrznych API (stdlib urllib)
+# Wyjątek walidacji
+# ---------------------------------------------------------------------------
+
+class ValidationError(ValueError):
+    """Błąd naruszenia reguł integralności danych przed eksportem do SQL."""
+
+    def __init__(self, bledy: list[str]) -> None:
+        self.bledy = bledy
+        naglowek = f"Wykryto {len(bledy)} błędów walidacji danych:"
+        szczegoly = "\n".join(f"  - {b}" for b in bledy[:50])
+        if len(bledy) > 50:
+            szczegoly += f"\n  ... oraz {len(bledy) - 50} kolejnych błędów."
+        super().__init__(f"{naglowek}\n{szczegoly}")
+
+
+# ---------------------------------------------------------------------------
+# Klient FakerAPI v2 (bez fallbacku)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -147,29 +204,37 @@ class OsobaAPI:
     data_urodzenia: date | None
 
 
+def ustal_plec_po_imieniu(imie: str, domyslna: str) -> str:
+    """Koryguje płeć na podstawie polskiego imienia (FakerAPI bywa niespójne z polem gender)."""
+    if not imie:
+        return domyslna
+    if imie in IMIONA_MESKIE_NA_A:
+        return "M"
+    if imie.endswith("a"):
+        return "K"
+    return "M"
+
+
+def dopasuj_nazwisko_do_plci(nazwisko: str, plec: str) -> str:
+    """Dopasowuje końcówki polskich nazwisk (-ski/-ska, -cki/-cka, -dzki/-dzka) do płci."""
+    if plec == "K" and nazwisko.endswith(("ski", "cki", "dzki")):
+        return nazwisko[:-1] + "a"
+    if plec == "M" and nazwisko.endswith(("ska", "cka", "dzka")):
+        return nazwisko[:-1] + "i"
+    return nazwisko
+
+
 def http_get_json(url: str, timeout: int = 15) -> Any:
     """Wykonuje żądanie HTTP GET i parsuje odpowiedź JSON."""
     req = urllib.request.Request(
         url,
         headers={
             "Accept": "application/json",
-            "User-Agent": "ZakladKarnyDataGenerator/1.0 (Python urllib)",
+            "User-Agent": "ZakladKarnyDataGenerator/2.0 (Python urllib)",
         },
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8")
-        return json.loads(raw)
-
-
-def dopasuj_nazwisko_do_plci(nazwisko: str, plec: str) -> str:
-    """Dopasowuje końcówki polskich nazwisk (-ski/-ska, -cki/-cka, -dzki/-dzka) do płci."""
-    if plec == "K":
-        if nazwisko.endswith(("ski", "cki", "dzki")):
-            return nazwisko[:-1] + "a"
-    elif plec == "M":
-        if nazwisko.endswith(("ska", "cka", "dzka")):
-            return nazwisko[:-1] + "i"
-    return nazwisko
+        return json.loads(resp.read().decode("utf-8"))
 
 
 def pobierz_osoby_fakerapi(
@@ -178,9 +243,10 @@ def pobierz_osoby_fakerapi(
     timeout: int = 15,
 ) -> list[OsobaAPI]:
     """
-    Pobiera polskie dane osobowe z FakerAPI v2:
+    Pobiera polskie dane osobowe z FakerAPI v2 (bez fallbacku):
     https://fakerapi.it/api/v2/persons?_locale=pl_PL&_quantity=...&_seed=...
     """
+    print(f"[API] Pobieranie {liczba} osób z FakerAPI (pl_PL)...")
     osoby: list[OsobaAPI] = []
     pozostalo = liczba
     partia_nr = 0
@@ -203,9 +269,10 @@ def pobierz_osoby_fakerapi(
             nazwisko = str(item.get("lastname", "")).strip()[:50]
             if not imie or not nazwisko:
                 continue
-            plec_raw = str(item.get("gender", "male")).lower()
-            plec = "K" if plec_raw == "female" else "M"
+            plec_api = "K" if str(item.get("gender", "male")).lower() == "female" else "M"
+            plec = ustal_plec_po_imieniu(imie, plec_api)
             nazwisko = dopasuj_nazwisko_do_plci(nazwisko, plec)
+
             bday: date | None = None
             bday_raw = item.get("birthday")
             if bday_raw:
@@ -213,131 +280,21 @@ def pobierz_osoby_fakerapi(
                     bday = date.fromisoformat(str(bday_raw)[:10])
                 except ValueError:
                     bday = None
+
             osoby.append(OsobaAPI(imie=imie, nazwisko=nazwisko, plec=plec, data_urodzenia=bday))
 
         pozostalo -= len(rekordy)
         partia_nr += 1
 
+    if len(osoby) < liczba:
+        raise RuntimeError(f"FakerAPI zwróciło za mało poprawnych osób ({len(osoby)}/{liczba}).")
+
+    print(f"[API] Pobrano {len(osoby[:liczba])} osób z FakerAPI.")
     return osoby[:liczba]
-
-
-def pobierz_osoby_randomuser(
-    liczba: int,
-    seed: int,
-    timeout: int = 15,
-) -> list[OsobaAPI]:
-    """
-    Pobiera dane osobowe z RandomUser API:
-    https://randomuser.me/api/?results=...&seed=...&inc=name,gender,dob
-    """
-    osoby: list[OsobaAPI] = []
-    pozostalo = liczba
-    partia_nr = 0
-
-    while pozostalo > 0:
-        batch = min(pozostalo, 5000)
-        params = urllib.parse.urlencode({
-            "results": batch,
-            "seed": f"zk-{seed}-{partia_nr}",
-            "inc": "name,gender,dob",
-        })
-        url = f"https://randomuser.me/api/?{params}"
-        payload = http_get_json(url, timeout=timeout)
-        rekordy = payload.get("results", [])
-        if not rekordy:
-            raise RuntimeError("RandomUser API zwróciło pustą listę osób.")
-
-        for item in rekordy:
-            name_obj = item.get("name") or {}
-            imie = str(name_obj.get("first", "")).strip()[:50]
-            nazwisko = str(name_obj.get("last", "")).strip()[:50]
-            if not imie or not nazwisko:
-                continue
-            plec = "K" if str(item.get("gender", "")).lower() == "female" else "M"
-            bday: date | None = None
-            dob_raw = (item.get("dob") or {}).get("date")
-            if dob_raw:
-                try:
-                    bday = date.fromisoformat(str(dob_raw)[:10])
-                except ValueError:
-                    bday = None
-            osoby.append(OsobaAPI(imie=imie, nazwisko=nazwisko, plec=plec, data_urodzenia=bday))
-
-        pozostalo -= len(rekordy)
-        partia_nr += 1
-
-    return osoby[:liczba]
-
-
-def pobierz_osoby_z_api(
-    liczba: int,
-    seed: int,
-    zrodlo: str,
-    timeout: int = 15,
-) -> tuple[list[OsobaAPI], str]:
-    """Pobiera osoby z wybranego API (z automatycznym przełączeniem na drugie API w razie awarii)."""
-    kolejnosc = (
-        [("fakerapi", pobierz_osoby_fakerapi), ("randomuser", pobierz_osoby_randomuser)]
-        if zrodlo == "fakerapi"
-        else [("randomuser", pobierz_osoby_randomuser), ("fakerapi", pobierz_osoby_fakerapi)]
-    )
-
-    bledy: list[str] = []
-    for nazwa, funkcja in kolejnosc:
-        try:
-            print(f"[API] Pobieranie {liczba} osób z {nazwa}...")
-            osoby = funkcja(liczba, seed, timeout=timeout)
-            if len(osoby) >= liczba:
-                print(f"[API] Pobrano {len(osoby)} osób z {nazwa}.")
-                return osoby, nazwa
-            bledy.append(f"{nazwa}: otrzymano za mało rekordów ({len(osoby)}/{liczba})")
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, RuntimeError) as exc:
-            bledy.append(f"{nazwa}: {exc}")
-            print(f"[API] Ostrzeżenie — nie udało się pobrać z {nazwa}: {exc}", file=sys.stderr)
-
-    raise RuntimeError(
-        "Nie udało się pobrać danych osobowych z żadnego zewnętrznego API:\n  - "
-        + "\n  - ".join(bledy)
-    )
-
-
-def pobierz_sady_saos(max_stron: int = 2, timeout: int = 15) -> list[str]:
-    """
-    Pobiera prawdziwe polskie sądy powszechne z publicznego API SAOS:
-    https://www.saos.org.pl/api/dump/commonCourts
-    """
-    print("[API] Pobieranie listy polskich sądów z SAOS API (saos.org.pl)...")
-    sady: list[str] = []
-
-    for page in range(max_stron):
-        params = urllib.parse.urlencode({"pageSize": 100, "pageNumber": page})
-        url = f"https://www.saos.org.pl/api/dump/commonCourts?{params}"
-        payload = http_get_json(url, timeout=timeout)
-        items = payload.get("items", [])
-        if not items:
-            break
-
-        for court in items:
-            name = str(court.get("name", "")).strip()
-            # Kolumna wyroki.sad ma typ varchar(100)
-            if name and len(name) <= 100:
-                sady.append(name)
-
-        links = payload.get("links") or []
-        has_next = any(link.get("rel") == "next" for link in links)
-        if not has_next:
-            break
-
-    # Usunięcie duplikatów z zachowaniem kolejności
-    unikalne = list(dict.fromkeys(sady))
-    if not unikalne:
-        raise RuntimeError("SAOS API nie zwróciło żadnych sądów.")
-    print(f"[API] Pobrano {len(unikalne)} sądów z SAOS API.")
-    return unikalne
 
 
 # ---------------------------------------------------------------------------
-# Pomocnicze funkcje domenowe
+# Pomocnicze funkcje domenowe (PESEL, znaczniki czasu)
 # ---------------------------------------------------------------------------
 
 def generuj_pesel(
@@ -361,18 +318,57 @@ def generuj_pesel(
         m_kod = miesiac
 
     prefix = f"{rok % 100:02d}{m_kod:02d}{dzien:02d}"
-    wagi = (1, 3, 7, 9, 1, 3, 7, 9, 1, 3)
 
     while True:
         seria = rng.randint(0, 999)
         cyfra_plci = rng.choice([1, 3, 5, 7, 9] if plec == "M" else [0, 2, 4, 6, 8])
         pierwsze_10 = f"{prefix}{seria:03d}{cyfra_plci}"
-        suma = sum(int(c) * w for c, w in zip(pierwsze_10, wagi))
+        suma = sum(int(c) * w for c, w in zip(pierwsze_10, PESEL_WAGI))
         kontrolna = (10 - (suma % 10)) % 10
         pesel = f"{pierwsze_10}{kontrolna}"
         if pesel not in uzyte_pesele:
             uzyte_pesele.add(pesel)
             return pesel
+
+
+def weryfikuj_pesel(pesel: str, data_ur: date) -> str | None:
+    """
+    Weryfikuje poprawność numeru PESEL:
+    - format dokładnie 11 cyfr (CHECK z bazy),
+    - poprawna cyfra kontrolna,
+    - zakodowana data zgodna z data_urodzenia.
+    Zwraca opis błędu albo None, jeśli PESEL jest poprawny.
+    """
+    if not PESEL_RE.match(pesel):
+        return f"PESEL '{pesel}' nie spełnia formatu ^[0-9]{{11}}$"
+
+    suma = sum(int(c) * w for c, w in zip(pesel[:10], PESEL_WAGI))
+    oczekiwana_kontrolna = (10 - (suma % 10)) % 10
+    if int(pesel[10]) != oczekiwana_kontrolna:
+        return f"PESEL '{pesel}' ma błędną cyfrę kontrolną (oczekiwano {oczekiwana_kontrolna})"
+
+    yy = int(pesel[0:2])
+    mm = int(pesel[2:4])
+    dd = int(pesel[4:6])
+
+    if 1 <= mm <= 12:
+        rok, miesiac = 1900 + yy, mm
+    elif 21 <= mm <= 32:
+        rok, miesiac = 2000 + yy, mm - 20
+    elif 81 <= mm <= 92:
+        rok, miesiac = 1800 + yy, mm - 80
+    else:
+        return f"PESEL '{pesel}' ma niepoprawny kod miesiąca ({mm})"
+
+    try:
+        data_z_pesel = date(rok, miesiac, dd)
+    except ValueError:
+        return f"PESEL '{pesel}' koduje nieistniejącą datę ({rok}-{miesiac:02d}-{dd:02d})"
+
+    if data_z_pesel != data_ur:
+        return f"PESEL '{pesel}' koduje datę {data_z_pesel}, różną od data_urodzenia={data_ur}"
+
+    return None
 
 
 def losowy_timestamp(start: datetime, end: datetime, rng: random.Random) -> datetime:
@@ -407,30 +403,22 @@ def generuj_dane(
     liczba_personelu: int,
     liczba_cel: int,
     seed: int,
-    api_source: str,
     timeout: int,
 ) -> DaneBazy:
     rng = random.Random(seed)
     teraz = datetime.now().replace(microsecond=0) - timedelta(hours=1)
     dzis = teraz.date()
 
-    # Pula osób do pobrania z API: więźniowie + personel + odwiedzający (zapas)
+    # Pula osób z FakerAPI: personel + więźniowie + odwiedzający
     liczba_odwiedzajacych_pula = max(50, liczba_wiezniow * 2)
-    lacznie_osob = liczba_wiezniow + liczba_personelu + liczba_odwiedzajacych_pula
-
-    osoby_api, _ = pobierz_osoby_z_api(
-        liczba=lacznie_osob,
-        seed=seed,
-        zrodlo=api_source,
-        timeout=timeout,
-    )
-    sady_api = pobierz_sady_saos(max_stron=2, timeout=timeout)
+    lacznie_osob = liczba_personelu + liczba_wiezniow + liczba_odwiedzajacych_pula
+    osoby_api = pobierz_osoby_fakerapi(liczba=lacznie_osob, seed=seed, timeout=timeout)
 
     osoby_personel = osoby_api[:liczba_personelu]
     osoby_wiezniowie = osoby_api[liczba_personelu:liczba_personelu + liczba_wiezniow]
     osoby_odwiedzajacy = osoby_api[liczba_personelu + liczba_wiezniow:]
 
-    # 1. Generowanie cel
+    # 1. Cele
     cele: list[dict[str, Any]] = []
     liczniki_blokow: dict[str, int] = {b[0]: 0 for b in BLOKI_KONFIG}
     wagi_blokow = [0.22, 0.28, 0.28, 0.14, 0.08]
@@ -438,12 +426,11 @@ def generuj_dane(
     for id_celi in range(1, liczba_cel + 1):
         blok, poziom, min_p, max_p = rng.choices(BLOKI_KONFIG, weights=wagi_blokow, k=1)[0]
         liczniki_blokow[blok] += 1
-        pojemnosc = rng.randint(min_p, max_p)
         cele.append({
             "id_celi": id_celi,
             "blok": blok,
             "numer_celi": f"{liczniki_blokow[blok]:03d}",
-            "pojemnosc": pojemnosc,
+            "pojemnosc": rng.randint(min_p, max_p),
             "poziom_zabezpieczen": poziom,
         })
 
@@ -463,19 +450,18 @@ def generuj_dane(
         })
         laczna_pojemnosc += pojemnosc
 
-    # 2. Generowanie personelu z danych API
+    # 2. Personel
     personel: list[dict[str, Any]] = []
     for id_funk, osoba in enumerate(osoby_personel, start=1):
-        stopien = rng.choice(STOPNIE_SW) if rng.random() > 0.03 else None
         personel.append({
             "id_funkcjonariusza": id_funk,
             "numer_sluzbowy": f"SW-{2015 + (id_funk % 11)}-{id_funk:04d}",
             "imie": osoba.imie,
             "nazwisko": osoba.nazwisko,
-            "stopien": stopien,
+            "stopien": rng.choice(STOPNIE_SW) if rng.random() > 0.03 else None,
         })
 
-    # 3. Generowanie więźniów, wyroków, przydziałów cel, widzeń i incydentów
+    # 3. Więźniowie, wyroki, przydziały cel, widzenia, incydenty
     wiezniowie: list[dict[str, Any]] = []
     wyroki: list[dict[str, Any]] = []
     przydzialy_cel: list[dict[str, Any]] = []
@@ -501,7 +487,6 @@ def generuj_dane(
             minutes=rng.randint(0, 59),
         )
 
-        # Używamy daty urodzenia z API, jeżeli spełnia wymóg wieku (>= 18 lat przy przyjęciu)
         max_ur_przy_przyjeciu = data_przyjecia.date() - timedelta(days=18 * 365 + 5)
         if (
             osoba.data_urodzenia is not None
@@ -516,22 +501,16 @@ def generuj_dane(
             if data_urodzenia > max_data_ur:
                 data_urodzenia = max_data_ur - timedelta(days=rng.randint(1, 365))
 
-        pesel = (
-            None
-            if rng.random() < 0.05
-            else generuj_pesel(data_urodzenia, osoba.plec, uzyte_pesele, rng)
-        )
+        pesel = generuj_pesel(data_urodzenia, osoba.plec, uzyte_pesele, rng)
 
         status_docelowy = rng.choices(STATUSY_WIEZNIOW, weights=STATUSY_WAGI, k=1)[0]
         wolne_cele = [c for c in cele if aktywne_oblozenie[c["id_celi"]] < c["pojemnosc"]]
         if status_docelowy == "osadzony" and not wolne_cele:
             status_docelowy = "zwolniony"
 
-        numer_ewidencyjny = f"ZK/{data_przyjecia.year}/{id_wieznia:05d}"
-
         wiezniowie.append({
             "id_wieznia": id_wieznia,
-            "numer_ewidencyjny": numer_ewidencyjny,
+            "numer_ewidencyjny": f"ZK/{data_przyjecia.year}/{id_wieznia:05d}",
             "pesel": pesel,
             "imie": osoba.imie,
             "nazwisko": osoba.nazwisko,
@@ -553,7 +532,7 @@ def generuj_dane(
             if koniec_pobytu > teraz:
                 koniec_pobytu = teraz - timedelta(minutes=rng.randint(10, 120))
 
-        # --- WYROKI ---
+        # --- WYROKI (sądy ze słownika SADY) ---
         liczba_wyrokow = rng.choices([1, 2, 3], weights=[0.65, 0.25, 0.10], k=1)[0]
         for idx_w in range(liczba_wyrokow):
             artykul, min_dni, max_dni = rng.choice(ARTYKULY_KK)
@@ -578,13 +557,12 @@ def generuj_dane(
 
             rok_akt = max(2015, data_rozp.year - rng.randint(0, 2))
             wydzial = rng.choice(["II K", "III K", "IV K", "V K", "VIII K", "XII K"])
-            sygnatura = f"{wydzial} {rng.randint(10, 1999)}/{rok_akt % 100:02d}"
 
             wyroki.append({
                 "id_wyroku": id_wyroku,
                 "id_wieznia": id_wieznia,
-                "sygnatura_akt": sygnatura,
-                "sad": rng.choice(sady_api),
+                "sygnatura_akt": f"{wydzial} {rng.randint(10, 1999)}/{rok_akt % 100:02d}",
+                "sad": rng.choice(SADY),
                 "artykul_kk": artykul,
                 "data_rozpoczecia": data_rozp,
                 "planowana_data_zakonczenia": planowana_koniec,
@@ -617,12 +595,10 @@ def generuj_dane(
                     c for c in cele
                     if aktywne_oblozenie[c["id_celi"]] < c["pojemnosc"]
                     and c["id_celi"] != poprzednia_cela
+                ] or [
+                    c for c in cele
+                    if aktywne_oblozenie[c["id_celi"]] < c["pojemnosc"]
                 ]
-                if not kandydaci:
-                    kandydaci = [
-                        c for c in cele
-                        if aktywne_oblozenie[c["id_celi"]] < c["pojemnosc"]
-                    ]
                 cela = rng.choice(kandydaci)
                 aktywne_oblozenie[cela["id_celi"]] += 1
                 data_do = None
@@ -656,9 +632,11 @@ def generuj_dane(
                 second=0,
             )
             if data_widz < data_przyjecia:
-                data_widz = data_przyjecia + timedelta(hours=1)
+                data_widz = data_przyjecia + timedelta(minutes=30)
             if data_widz > koniec_pobytu:
                 data_widz = koniec_pobytu - timedelta(minutes=30)
+            if data_widz < data_przyjecia:
+                data_widz = data_przyjecia
 
             widzenia.append({
                 "id_widzenia": id_widzenia,
@@ -675,7 +653,7 @@ def generuj_dane(
         liczba_incydentow = rng.choices([0, 1, 2, 3, 4], weights=[0.42, 0.30, 0.16, 0.08, 0.04], k=1)[0]
         for _ in range(liczba_incydentow):
             typ = rng.choices(
-                ["bojka", "kontrabanda", "proba_ucieczki", "nagroda", "inne"],
+                TYPY_INCYDENTOW,
                 weights=[0.24, 0.22, 0.06, 0.28, 0.20],
                 k=1,
             )[0]
@@ -703,70 +681,312 @@ def generuj_dane(
 
 
 # ---------------------------------------------------------------------------
-# Walidacja spójności wygenerowanych danych
+# Rozbudowana walidacja danych (bez assert, zbiera wszystkie naruszenia)
 # ---------------------------------------------------------------------------
+
+def _sprawdz_tekst(
+    bledy: list[str],
+    kontekst: str,
+    wartosc: Any,
+    max_dlugosc: int,
+    wymagany: bool = True,
+    min_dlugosc: int = 1,
+) -> None:
+    if wartosc is None:
+        if wymagany:
+            bledy.append(f"{kontekst}: wartość wymagana (NOT NULL), otrzymano NULL")
+        return
+    if not isinstance(wartosc, str):
+        bledy.append(f"{kontekst}: oczekiwano typu str, otrzymano {type(wartosc).__name__}")
+        return
+    oczyszczony = wartosc.strip()
+    if len(oczyszczony) < min_dlugosc:
+        bledy.append(f"{kontekst}: zbyt krótki tekst (min {min_dlugosc}, otrzymano {len(oczyszczony)})")
+    if len(wartosc) > max_dlugosc:
+        bledy.append(f"{kontekst}: przekroczono limit długości ({len(wartosc)} > {max_dlugosc})")
+
 
 def waliduj_dane(dane: DaneBazy) -> None:
-    """Weryfikuje wszystkie reguły integralności z dokumentu projektowego."""
-    dzis = date.today()
-    limit_wieku = dzis - timedelta(days=17 * 365 + 4)
+    """
+    Kompleksowa walidacja wszystkich tabel przed eksportem do PostgreSQL:
+    - typy, NOT NULL, limity długości kolumn (varchar/char),
+    - unikalność PK i kolumn UNIQUE (w tym par i indeksów częściowych),
+    - integralność wszystkich kluczy obcych (FK),
+    - wszystkie reguły CHECK z Bazy-danych-projekt-1.pdf (m.in. PESEL z sumą kontrolną
+      i zgodnością z datą urodzenia, wiek >= 17 lat, daty wyroków, czas widzeń, opisy),
+    - spójność czasowa (brak nakładających się przydziałów cel, brak dat zdarzeń
+      przed przyjęciem lub w przyszłości),
+    - zgodność z wyzwalaczami (pojemność cel, jeden aktywny przydział dla osadzonego,
+      brak aktywnych przydziałów dla osób o statusie innym niż 'osadzony').
+    """
+    bledy: list[str] = []
+    teraz = datetime.now()
+    dzis = teraz.date()
+    limit_wieku_17 = dzis - timedelta(days=17 * 365 + 4)
 
+    # --- 1. CELE ---
+    cele_ids: set[int] = set()
     pary_cel: set[tuple[str, str]] = set()
-    pojemnosci: dict[int, int] = {}
+    pojemnosci_cel: dict[int, int] = {}
+
     for c in dane.cele:
+        cid = c["id_celi"]
+        ctx = f"cele(id_celi={cid})"
+        if not isinstance(cid, int) or cid <= 0 or cid in cele_ids:
+            bledy.append(f"{ctx}: niepoprawne lub zduplikowane id_celi")
+        cele_ids.add(cid)
+
+        _sprawdz_tekst(bledy, f"{ctx}.blok", c["blok"], max_dlugosc=10)
+        _sprawdz_tekst(bledy, f"{ctx}.numer_celi", c["numer_celi"], max_dlugosc=10)
+
         klucz = (c["blok"], c["numer_celi"])
-        assert klucz not in pary_cel, f"Duplikat celi: {klucz}"
+        if klucz in pary_cel:
+            bledy.append(f"{ctx}: naruszenie UNIQUE(blok, numer_celi) dla {klucz}")
         pary_cel.add(klucz)
-        assert 0 < c["pojemnosc"] <= 20
-        assert c["poziom_zabezpieczen"] in {"otwarty", "polotwarty", "zamkniety", "izolatka"}
-        pojemnosci[c["id_celi"]] = c["pojemnosc"]
 
-    numery_sluzb = {p["numer_sluzbowy"] for p in dane.personel}
-    assert len(numery_sluzb) == len(dane.personel)
+        poj = c["pojemnosc"]
+        if not isinstance(poj, int) or not (0 < poj <= 20):
+            bledy.append(f"{ctx}.pojemnosc: wartość {poj} poza zakresem (1..20)")
+        pojemnosci_cel[cid] = poj
 
-    pesele: set[str] = set()
-    nr_ewid: set[str] = set()
-    statusy_w: dict[int, str] = {}
+        if c["poziom_zabezpieczen"] not in POZIOMY_ZABEZPIECZEN:
+            bledy.append(f"{ctx}.poziom_zabezpieczen: niedozwolona wartość '{c['poziom_zabezpieczen']}'")
+
+    # --- 2. PERSONEL ---
+    personel_ids: set[int] = set()
+    numery_sluzbowe: set[str] = set()
+
+    for p in dane.personel:
+        pid = p["id_funkcjonariusza"]
+        ctx = f"personel(id_funkcjonariusza={pid})"
+        if not isinstance(pid, int) or pid <= 0 or pid in personel_ids:
+            bledy.append(f"{ctx}: niepoprawne lub zduplikowane id_funkcjonariusza")
+        personel_ids.add(pid)
+
+        _sprawdz_tekst(bledy, f"{ctx}.numer_sluzbowy", p["numer_sluzbowy"], max_dlugosc=20)
+        if p["numer_sluzbowy"] in numery_sluzbowe:
+            bledy.append(f"{ctx}: zduplikowany numer_sluzbowy '{p['numer_sluzbowy']}'")
+        numery_sluzbowe.add(p["numer_sluzbowy"])
+
+        _sprawdz_tekst(bledy, f"{ctx}.imie", p["imie"], max_dlugosc=50)
+        _sprawdz_tekst(bledy, f"{ctx}.nazwisko", p["nazwisko"], max_dlugosc=50)
+        _sprawdz_tekst(bledy, f"{ctx}.stopien", p["stopien"], max_dlugosc=30, wymagany=False)
+
+    # --- 3. WIEZNIOWIE ---
+    wiezniowie_by_id: dict[int, dict[str, Any]] = {}
+    numery_ewidencyjne: set[str] = set()
+    uzyte_pesele: set[str] = set()
+
     for w in dane.wiezniowie:
-        assert w["numer_ewidencyjny"] not in nr_ewid
-        nr_ewid.add(w["numer_ewidencyjny"])
-        assert 1 <= len(w["imie"]) <= 50 and 1 <= len(w["nazwisko"]) <= 50
-        if w["pesel"] is not None:
-            assert len(w["pesel"]) == 11 and w["pesel"].isdigit()
-            assert w["pesel"] not in pesele
-            pesele.add(w["pesel"])
-        assert w["data_urodzenia"] <= limit_wieku
-        assert w["status"] in {"osadzony", "zwolniony", "przeniesiony", "zbiegly", "zmarly"}
-        statusy_w[w["id_wieznia"]] = w["status"]
+        wid = w["id_wieznia"]
+        ctx = f"wiezniowie(id_wieznia={wid})"
+        if not isinstance(wid, int) or wid <= 0 or wid in wiezniowie_by_id:
+            bledy.append(f"{ctx}: niepoprawne lub zduplikowane id_wieznia")
+        wiezniowie_by_id[wid] = w
+
+        _sprawdz_tekst(bledy, f"{ctx}.numer_ewidencyjny", w["numer_ewidencyjny"], max_dlugosc=20)
+        if w["numer_ewidencyjny"] in numery_ewidencyjne:
+            bledy.append(f"{ctx}: zduplikowany numer_ewidencyjny '{w['numer_ewidencyjny']}'")
+        numery_ewidencyjne.add(w["numer_ewidencyjny"])
+
+        _sprawdz_tekst(bledy, f"{ctx}.imie", w["imie"], max_dlugosc=50)
+        _sprawdz_tekst(bledy, f"{ctx}.nazwisko", w["nazwisko"], max_dlugosc=50)
+
+        data_ur = w["data_urodzenia"]
+        data_przyj = w["data_przyjecia"]
+        if not isinstance(data_ur, date):
+            bledy.append(f"{ctx}.data_urodzenia: oczekiwano date")
+        else:
+            if data_ur > limit_wieku_17:
+                bledy.append(f"{ctx}.data_urodzenia: {data_ur} narusza wymóg wieku >= 17 lat")
+            if isinstance(data_przyj, datetime):
+                limit_przy_przyjeciu = data_przyj.date() - timedelta(days=17 * 365 + 4)
+                if data_ur > limit_przy_przyjeciu:
+                    bledy.append(
+                        f"{ctx}: wiek w dniu przyjęcia ({data_przyj.date()}) poniżej 17 lat (ur. {data_ur})"
+                    )
+
+        if not isinstance(data_przyj, datetime):
+            bledy.append(f"{ctx}.data_przyjecia: oczekiwano datetime")
+        elif data_przyj > teraz:
+            bledy.append(f"{ctx}.data_przyjecia: data w przyszłości ({data_przyj})")
+
+        pesel = w["pesel"]
+        if pesel is None:
+            bledy.append(f"{ctx}.pesel: wartość wymagana (NOT NULL), otrzymano NULL")
+        elif not isinstance(pesel, str):
+            bledy.append(f"{ctx}.pesel: oczekiwano str, otrzymano {type(pesel).__name__}")
+        else:
+            if pesel in uzyte_pesele:
+                bledy.append(f"{ctx}.pesel: zduplikowany PESEL '{pesel}'")
+            uzyte_pesele.add(pesel)
+            if isinstance(data_ur, date):
+                blad_pesel = weryfikuj_pesel(pesel, data_ur)
+                if blad_pesel:
+                    bledy.append(f"{ctx}: {blad_pesel}")
+
+        if w["status"] not in STATUSY_WIEZNIOW:
+            bledy.append(f"{ctx}.status: niedozwolona wartość '{w['status']}'")
+
+    # --- 4. WYROKI ---
+    wyroki_ids: set[int] = set()
+    wyroki_na_wieznia: dict[int, list[dict[str, Any]]] = {wid: [] for wid in wiezniowie_by_id}
 
     for wyr in dane.wyroki:
-        assert 1 <= len(wyr["sad"]) <= 100
-        assert wyr["planowana_data_zakonczenia"] >= wyr["data_rozpoczecia"]
-        if wyr["rzeczywista_data_zakonczenia"] is not None:
-            assert wyr["rzeczywista_data_zakonczenia"] >= wyr["data_rozpoczecia"]
+        wyr_id = wyr["id_wyroku"]
+        ctx = f"wyroki(id_wyroku={wyr_id})"
+        if not isinstance(wyr_id, int) or wyr_id <= 0 or wyr_id in wyroki_ids:
+            bledy.append(f"{ctx}: niepoprawne lub zduplikowane id_wyroku")
+        wyroki_ids.add(wyr_id)
 
-    aktywne_na_wieznia: set[int] = set()
-    oblozenie_celi: dict[int, int] = {}
-    for p in dane.przydzialy_cel:
-        if p["data_do"] is None:
-            assert p["id_wieznia"] not in aktywne_na_wieznia, "Więzień ma >1 aktywny przydział!"
-            assert statusy_w[p["id_wieznia"]] == "osadzony", "Nieaktywny więzień ma otwarty przydział!"
-            aktywne_na_wieznia.add(p["id_wieznia"])
-            oblozenie_celi[p["id_celi"]] = oblozenie_celi.get(p["id_celi"], 0) + 1
-            assert oblozenie_celi[p["id_celi"]] <= pojemnosci[p["id_celi"]], "Przekroczono pojemność celi!"
+        wid = wyr["id_wieznia"]
+        if wid not in wiezniowie_by_id:
+            bledy.append(f"{ctx}: naruszenie FK id_wieznia={wid}")
         else:
-            assert p["data_do"] > p["data_od"], "data_do <= data_od!"
+            wyroki_na_wieznia[wid].append(wyr)
 
-    for wid in dane.widzenia:
-        assert 1 <= wid["czas_trwania_min"] <= 240
+        _sprawdz_tekst(bledy, f"{ctx}.sygnatura_akt", wyr["sygnatura_akt"], max_dlugosc=50)
+        _sprawdz_tekst(bledy, f"{ctx}.sad", wyr["sad"], max_dlugosc=100)
+        _sprawdz_tekst(bledy, f"{ctx}.artykul_kk", wyr["artykul_kk"], max_dlugosc=50)
 
+        d_rozp = wyr["data_rozpoczecia"]
+        d_plan = wyr["planowana_data_zakonczenia"]
+        d_rzecz = wyr["rzeczywista_data_zakonczenia"]
+
+        if d_plan < d_rozp:
+            bledy.append(f"{ctx}: planowana_data_zakonczenia ({d_plan}) < data_rozpoczecia ({d_rozp})")
+        if d_rzecz is not None and d_rzecz < d_rozp:
+            bledy.append(f"{ctx}: rzeczywista_data_zakonczenia ({d_rzecz}) < data_rozpoczecia ({d_rozp})")
+
+    for wid, w in wiezniowie_by_id.items():
+        lista_wyr = wyroki_na_wieznia[wid]
+        if not lista_wyr:
+            bledy.append(f"wiezniowie(id_wieznia={wid}): brak przypisanych wyroków")
+            continue
+        if w["status"] == "osadzony" and not any(x["rzeczywista_data_zakonczenia"] is None for x in lista_wyr):
+            bledy.append(f"wiezniowie(id_wieznia={wid}): aktywny osadzony nie ma otwartego wyroku")
+        if w["status"] == "zwolniony" and any(x["rzeczywista_data_zakonczenia"] is None for x in lista_wyr):
+            bledy.append(f"wiezniowie(id_wieznia={wid}): zwolniony więzień ma niezakończony wyrok")
+
+    # --- 5. PRZYDZIALY_CEL ---
+    przydzialy_ids: set[int] = set()
+    przydzialy_na_wieznia: dict[int, list[dict[str, Any]]] = {wid: [] for wid in wiezniowie_by_id}
+    aktywne_oblozenie: dict[int, int] = {cid: 0 for cid in cele_ids}
+
+    for pr in dane.przydzialy_cel:
+        pr_id = pr["id_przydzialu"]
+        ctx = f"przydzialy_cel(id_przydzialu={pr_id})"
+        if not isinstance(pr_id, int) or pr_id <= 0 or pr_id in przydzialy_ids:
+            bledy.append(f"{ctx}: niepoprawne lub zduplikowane id_przydzialu")
+        przydzialy_ids.add(pr_id)
+
+        wid = pr["id_wieznia"]
+        cid = pr["id_celi"]
+        if wid not in wiezniowie_by_id:
+            bledy.append(f"{ctx}: naruszenie FK id_wieznia={wid}")
+        else:
+            przydzialy_na_wieznia[wid].append(pr)
+            if pr["data_od"] < wiezniowie_by_id[wid]["data_przyjecia"]:
+                bledy.append(f"{ctx}: data_od ({pr['data_od']}) wcześniejsza niż data_przyjecia więźnia")
+
+        if cid not in cele_ids:
+            bledy.append(f"{ctx}: naruszenie FK id_celi={cid}")
+
+        if pr["data_od"] > teraz:
+            bledy.append(f"{ctx}: data_od w przyszłości ({pr['data_od']})")
+        if pr["data_do"] is not None:
+            if pr["data_do"] <= pr["data_od"]:
+                bledy.append(f"{ctx}: naruszenie CHECK (data_do <= data_od)")
+            if pr["data_do"] > teraz:
+                bledy.append(f"{ctx}: data_do w przyszłości ({pr['data_do']})")
+        elif cid in aktywne_oblozenie:
+            aktywne_oblozenie[cid] += 1
+
+    # Weryfikacja indeksów częściowych, ciągłości historii i pojemności cel
+    for wid, w in wiezniowie_by_id.items():
+        historia = sorted(przydzialy_na_wieznia[wid], key=lambda x: x["data_od"])
+        aktywne = [x for x in historia if x["data_do"] is None]
+        if len(aktywne) > 1:
+            bledy.append(f"wiezniowie(id_wieznia={wid}): naruszenie idx_jeden_aktywny_przydzial ({len(aktywne)})")
+        if w["status"] == "osadzony" and len(aktywne) != 1:
+            bledy.append(f"wiezniowie(id_wieznia={wid}): osadzony musi mieć dokładnie 1 aktywny przydział")
+        if w["status"] != "osadzony" and len(aktywne) != 0:
+            bledy.append(f"wiezniowie(id_wieznia={wid}): status '{w['status']}' nie może mieć otwartego przydziału")
+
+        for prev, curr in zip(historia, historia[1:]):
+            if prev["data_do"] is None or prev["data_do"] > curr["data_od"]:
+                bledy.append(
+                    f"wiezniowie(id_wieznia={wid}): nakładające się przydziały cel "
+                    f"(id {prev['id_przydzialu']} i {curr['id_przydzialu']})"
+                )
+
+    for cid, liczba_os in aktywne_oblozenie.items():
+        if liczba_os > pojemnosci_cel[cid]:
+            bledy.append(
+                f"cele(id_celi={cid}): przekroczono pojemność celi ({liczba_os} > {pojemnosci_cel[cid]})"
+            )
+
+    # --- 6. WIDZENIA ---
+    widzenia_ids: set[int] = set()
+    for wid_rec in dane.widzenia:
+        vid = wid_rec["id_widzenia"]
+        ctx = f"widzenia(id_widzenia={vid})"
+        if not isinstance(vid, int) or vid <= 0 or vid in widzenia_ids:
+            bledy.append(f"{ctx}: niepoprawne lub zduplikowane id_widzenia")
+        widzenia_ids.add(vid)
+
+        wid = wid_rec["id_wieznia"]
+        if wid not in wiezniowie_by_id:
+            bledy.append(f"{ctx}: naruszenie FK id_wieznia={wid}")
+        else:
+            if wid_rec["data_widzenia"] < wiezniowie_by_id[wid]["data_przyjecia"]:
+                bledy.append(f"{ctx}: data_widzenia przed datą przyjęcia więźnia")
+
+        _sprawdz_tekst(bledy, f"{ctx}.imie_odwiedzajacego", wid_rec["imie_odwiedzajacego"], max_dlugosc=50)
+        _sprawdz_tekst(bledy, f"{ctx}.nazwisko_odwiedzajacego", wid_rec["nazwisko_odwiedzajacego"], max_dlugosc=50)
+        _sprawdz_tekst(bledy, f"{ctx}.relacja", wid_rec["relacja"], max_dlugosc=30, wymagany=False)
+
+        if wid_rec["data_widzenia"] > teraz:
+            bledy.append(f"{ctx}: data_widzenia w przyszłości ({wid_rec['data_widzenia']})")
+
+        czas = wid_rec["czas_trwania_min"]
+        if czas is not None and (not isinstance(czas, int) or not (1 <= czas <= 240)):
+            bledy.append(f"{ctx}.czas_trwania_min: wartość {czas} poza zakresem (1..240)")
+
+    # --- 7. INCYDENTY ---
+    incydenty_ids: set[int] = set()
     for inc in dane.incydenty:
-        assert inc["typ"] in {"bojka", "kontrabanda", "proba_ucieczki", "nagroda", "inne"}
-        assert len(inc["opis"].strip()) >= 5
+        iid = inc["id_incydentu"]
+        ctx = f"incydenty(id_incydentu={iid})"
+        if not isinstance(iid, int) or iid <= 0 or iid in incydenty_ids:
+            bledy.append(f"{ctx}: niepoprawne lub zduplikowane id_incydentu")
+        incydenty_ids.add(iid)
+
+        wid = inc["id_wieznia"]
+        if wid not in wiezniowie_by_id:
+            bledy.append(f"{ctx}: naruszenie FK id_wieznia={wid}")
+        else:
+            if inc["data_zdarzenia"] < wiezniowie_by_id[wid]["data_przyjecia"]:
+                bledy.append(f"{ctx}: data_zdarzenia przed datą przyjęcia więźnia")
+
+        fid = inc["id_funkcjonariusza"]
+        if fid is not None and fid not in personel_ids:
+            bledy.append(f"{ctx}: naruszenie FK id_funkcjonariusza={fid}")
+
+        if inc["data_zdarzenia"] > teraz:
+            bledy.append(f"{ctx}: data_zdarzenia w przyszłości ({inc['data_zdarzenia']})")
+
+        if inc["typ"] not in TYPY_INCYDENTOW:
+            bledy.append(f"{ctx}.typ: niedozwolona wartość '{inc['typ']}'")
+
+        _sprawdz_tekst(bledy, f"{ctx}.opis", inc["opis"], max_dlugosc=10_000, min_dlugosc=5)
+
+    if bledy:
+        raise ValidationError(bledy)
 
 
 # ---------------------------------------------------------------------------
-# Eksport do SQL (PostgreSQL) oraz CSV
+# Eksport do SQL (PostgreSQL)
 # ---------------------------------------------------------------------------
 
 def sql_val(val: Any) -> str:
@@ -797,10 +1017,10 @@ def zapisz_insert_batch(
     for i in range(0, len(wiersze), batch_size):
         paczkowane = wiersze[i:i + batch_size]
         f.write(f"INSERT INTO {tabela} ({cols_sql}) VALUES\n")
-        linie = []
-        for row in paczkowane:
-            vals = ", ".join(sql_val(row[k]) for k in kolumny)
-            linie.append(f"    ({vals})")
+        linie = [
+            f"    ({', '.join(sql_val(row[k]) for k in kolumny)})"
+            for row in paczkowane
+        ]
         f.write(",\n".join(linie))
         f.write(";\n\n")
 
@@ -810,7 +1030,7 @@ def eksportuj_sql(dane: DaneBazy, sciezka: Path) -> None:
     with sciezka.open("w", encoding="utf-8") as f:
         f.write("-- =====================================================================\n")
         f.write("-- Dane testowe: System Ewidencji Zakładu Karnego (PostgreSQL)\n")
-        f.write("-- Źródła zewnętrzne: FakerAPI / RandomUser + SAOS API (saos.org.pl)\n")
+        f.write("-- Źródło danych osobowych: FakerAPI v2 (pl_PL)\n")
         f.write(f"-- Wygenerowano: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write("-- =====================================================================\n\n")
         f.write("BEGIN;\n\n")
@@ -927,57 +1147,31 @@ def eksportuj_sql(dane: DaneBazy, sciezka: Path) -> None:
         f.write("COMMIT;\n")
 
 
-def eksportuj_csv(dane: DaneBazy, katalog: Path) -> None:
-    katalog.mkdir(parents=True, exist_ok=True)
-    tabele: list[tuple[str, list[dict[str, Any]]]] = [
-        ("cele", dane.cele),
-        ("personel", dane.personel),
-        ("wiezniowie", dane.wiezniowie),
-        ("wyroki", dane.wyroki),
-        ("przydzialy_cel", dane.przydzialy_cel),
-        ("widzenia", dane.widzenia),
-        ("incydenty", dane.incydenty),
-    ]
-    for nazwa, wiersze in tabele:
-        if not wiersze:
-            continue
-        sciezka = katalog / f"{nazwa}.csv"
-        kolumny = list(wiersze[0].keys())
-        with sciezka.open("w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=kolumny)
-            writer.writeheader()
-            for row in wiersze:
-                formatted = {}
-                for k, v in row.items():
-                    if isinstance(v, datetime):
-                        formatted[k] = v.strftime("%Y-%m-%d %H:%M:%S")
-                    elif isinstance(v, date):
-                        formatted[k] = v.strftime("%Y-%m-%d")
-                    elif v is None:
-                        formatted[k] = ""
-                    else:
-                        formatted[k] = v
-                writer.writerow(formatted)
-
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
+def dodatnia_liczba(wartosc: str) -> int:
+    liczba = int(wartosc)
+    if liczba <= 0:
+        raise argparse.ArgumentTypeError("wartość musi być większa od 0")
+    return liczba
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generator danych testowych dla bazy danych Zakładu Karnego (z zewnętrznych API)."
+        description="Generator danych testowych PostgreSQL dla bazy danych Zakładu Karnego."
     )
     parser.add_argument(
-        "--wiezniowie", type=int, default=100,
+        "--wiezniowie", type=dodatnia_liczba, default=100,
         help="Liczba więźniów do wygenerowania (domyślnie: 100)",
     )
     parser.add_argument(
-        "--personel", type=int, default=30,
+        "--personel", type=dodatnia_liczba, default=30,
         help="Liczba funkcjonariuszy do wygenerowania (domyślnie: 30)",
     )
     parser.add_argument(
-        "--cele", type=int, default=40,
+        "--cele", type=dodatnia_liczba, default=40,
         help="Minimalna liczba cel do wygenerowania (domyślnie: 40)",
     )
     parser.add_argument(
@@ -985,20 +1179,12 @@ def main() -> None:
         help="Ziarno generatora losowego (domyślnie: 42)",
     )
     parser.add_argument(
-        "--api-source", choices=["fakerapi", "randomuser"], default="fakerapi",
-        help="Główne źródło API dla danych osobowych (domyślnie: fakerapi)",
-    )
-    parser.add_argument(
-        "--timeout", type=int, default=15,
+        "--timeout", type=dodatnia_liczba, default=15,
         help="Limit czasu na zapytanie HTTP w sekundach (domyślnie: 15)",
     )
     parser.add_argument(
-        "--format", choices=["sql", "csv"], default="sql",
-        help="Format wyjściowy: sql lub csv (domyślnie: sql)",
-    )
-    parser.add_argument(
-        "--output", type=str, default=None,
-        help="Ścieżka pliku SQL lub katalogu CSV (domyślnie: seed_data.sql lub ./csv_data)",
+        "--output", type=str, default="seed_data.sql",
+        help="Ścieżka wyjściowego pliku SQL dla PostgreSQL (domyślnie: seed_data.sql)",
     )
     args = parser.parse_args()
 
@@ -1007,21 +1193,15 @@ def main() -> None:
         liczba_personelu=args.personel,
         liczba_cel=args.cele,
         seed=args.seed,
-        api_source=args.api_source,
         timeout=args.timeout,
     )
 
-    if args.format == "sql":
-        sciezka = Path(args.output or "seed_data.sql")
-        eksportuj_sql(dane, sciezka)
-        cel_wyjscia = str(sciezka.resolve())
-    else:
-        katalog = Path(args.output or "csv_data")
-        eksportuj_csv(dane, katalog)
-        cel_wyjscia = str(katalog.resolve())
+    sciezka = Path(args.output)
+    eksportuj_sql(dane, sciezka)
 
     aktywni = sum(1 for w in dane.wiezniowie if w["status"] == "osadzony")
-    print("Wygenerowano dane poprawnie:")
+    print("Walidacja danych zakończona pomyślnie (0 błędów).")
+    print("Wygenerowano dane:")
     print(f"  - cele:           {len(dane.cele)}")
     print(f"  - personel:       {len(dane.personel)}")
     print(f"  - wiezniowie:     {len(dane.wiezniowie)} (w tym aktywni osadzeni: {aktywni})")
@@ -1029,7 +1209,7 @@ def main() -> None:
     print(f"  - przydzialy_cel: {len(dane.przydzialy_cel)}")
     print(f"  - widzenia:       {len(dane.widzenia)}")
     print(f"  - incydenty:      {len(dane.incydenty)}")
-    print(f"Zapisano do: {cel_wyjscia}")
+    print(f"Zapisano do: {sciezka.resolve()}")
 
 
 if __name__ == "__main__":
